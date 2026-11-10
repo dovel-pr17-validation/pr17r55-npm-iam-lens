@@ -1,0 +1,42 @@
+{
+  "no-policy-bucket": {
+    "accountId": "400000000002",
+    "region": "us-east-1"
+  },
+  "alpha-only-bucket": {
+    "accountId": "400000000002",
+    "region": "us-east-1"
+  },
+  "account-bpa-public-bucket": {
+    "accountId": "500000000001",
+    "region": "us-west-2"
+  },
+  "bucket-bpa-public-bucket": {
+    "accountId": "500000000002",
+    "region": "us-west-2"
+  },
+  "no-bpa-public-bucket": {
+    "accountId": "500000000003",
+    "region": "us-west-2"
+  },
+  "anonymous-context-bucket": {
+    "accountId": "500000000003",
+    "region": "us-west-2"
+  },
+  "account-bpa-specific-principal-bucket": {
+    "accountId": "500000000001",
+    "region": "us-west-2"
+  },
+  "bucket-bpa-specific-principal-bucket": {
+    "accountId": "500000000002",
+    "region": "us-west-2"
+  },
+  "external-principal-tag-bucket": {
+    "accountId": "400000000002",
+    "region": "us-east-1"
+  },
+  "external-principal-tag-cross-account-bucket": {
+    "accountId": "400000000001",
+    "region": "us-east-1"
+  }
+}

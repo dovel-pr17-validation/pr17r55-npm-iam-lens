@@ -1,0 +1,35 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Statement1",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "sts:AssumeRole",
+      "NotResource": "arn:aws:iam::200000000002:role/TestCrossAccount",
+      "Condition": {
+        "Null": {
+          "sts:ExternalId": "true"
+        },
+        "StringNotEquals": {
+          "aws:PrincipalOrgId": "o-22222222"
+        },
+        "BoolIfExists": {
+          "aws:PrincipalIsAWSService": "false"
+        }
+      }
+    },
+    {
+      "Sid": "ListBuckets",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:ListAllMyBuckets"],
+      "Resource": ["*"],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::200000000002:user/user2"
+        }
+      }
+    }
+  ]
+}

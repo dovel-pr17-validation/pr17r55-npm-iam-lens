@@ -1,0 +1,1765 @@
+import { type EvaluationResult } from '@actsecurity/iam-simulate'
+import { assert, describe, expect, it, vi } from 'vitest'
+import { testStore } from '../collect/inMemoryClient.js'
+import { anonymousKnownAbsentContextKeyNames } from './contextKeys.js'
+import { saveRole, saveUser } from '../utils/testUtils.js'
+import {
+  discoveryConstraintForGeneratedKey,
+  mergeDiscoveryContextKeyConstraints,
+  resultMatchesExpectation,
+  simulateExternalResourceRequest,
+  simulateRequest,
+  simulateVirtualResourceRequest,
+  type SimulationRequest,
+  type VirtualResourceSimulationRequest
+} from './simulate.js'
+
+describe('simulateRequest', () => {
+  it.each(['arn:aws:s3:::example-bucket', 'arn:aws:s3:::example-bucket/*'])(
+    'evaluates the S3 resource account condition in discovery for %s',
+    async (resourceArn) => {
+      //Given an identity grant restricted to a different resource owner
+      const { store, client } = testStore()
+      const accountId = '123456789012'
+      const principal = `arn:aws:iam::${accountId}:role/ExampleRole`
+      await saveRole(store, {
+        arn: principal,
+        inlinePolicies: [
+          {
+            PolicyName: 'CrossAccount',
+            PolicyDocument: {
+              Version: '2012-10-17',
+              Statement: {
+                Effect: 'Allow',
+                Action: 's3:*',
+                Resource: '*',
+                Condition: { StringNotEquals: { 's3:ResourceAccount': accountId } }
+              }
+            }
+          }
+        ]
+      })
+      const action = resourceArn.endsWith('/*') ? 's3:GetObject' : 's3:GetBucketLocation'
+      const request = {
+        simulationMode: 'Discovery' as const,
+        principal,
+        resourceArn,
+        resourceAccount: accountId,
+        action,
+        customContextKeys: {}
+      }
+
+      //When the owner is equal and when a caller explicitly overrides it
+      const same = await simulateRequest(request, client)
+      const overridden = await simulateRequest(
+        { ...request, customContextKeys: { 'S3:RESOURCEACCOUNT': '999999999999' } },
+        client
+      )
+
+      //Then the same-owner grant does not apply, while the explicit override is honored
+      expect(same.result.overallResult).toBe('ImplicitlyDenied')
+      expect(overridden.result.overallResult).toBe('Allowed')
+    }
+  )
+  it.each(['metadata', 'bpa', 's3-bpa'] as const)(
+    'simulates an S3 request with JSON null %s metadata',
+    async (metadataKind) => {
+      //Given a role allowed to read an object and one null S3 metadata source
+      const { store, client } = testStore()
+      const accountId = '123456789012'
+      const bucketArn = 'arn:aws:s3:::example-bucket'
+      const principal = `arn:aws:iam::${accountId}:role/ExampleRole`
+      await saveRole(store, {
+        arn: principal,
+        inlinePolicies: [
+          {
+            PolicyName: 'ReadObject',
+            PolicyDocument: {
+              Version: '2012-10-17',
+              Statement: { Effect: 'Allow', Action: 's3:GetObject', Resource: `${bucketArn}/*` }
+            }
+          }
+        ]
+      })
+      if (metadataKind === 's3-bpa') {
+        await store.saveAccountMetadata(accountId, metadataKind, 'null')
+      } else {
+        await store.saveResourceMetadata(accountId, bucketArn, metadataKind, 'null')
+      }
+      //When simulating a normal S3 request without an ABAC override
+      const { result } = await simulateRequest(
+        {
+          simulationMode: 'Strict',
+          principal,
+          resourceArn: `${bucketArn}/example.txt`,
+          resourceAccount: accountId,
+          action: 's3:GetObject',
+          customContextKeys: {}
+        },
+        client
+      )
+
+      //Then the missing security settings do not prevent the known grant
+      expect(result.resultType).toBe('single')
+      expect(result.overallResult).toBe('Allowed')
+    }
+  )
+
+  it('should omit RCPs when a service principal assumes a service-linked role', async () => {
+    //Given a service principal, a service-linked target role, and an RCP on the target account
+    const { store, client } = testStore()
+    const targetAccountId = '210987654321'
+    const servicePrincipal = 'example.amazonaws.com'
+    const targetRoleArn = `arn:aws:iam::${targetAccountId}:role/aws-service-role/example.amazonaws.com/AWSServiceRoleForExample`
+    const orgId = 'o-exampleorg'
+
+    await saveRole(store, {
+      arn: targetRoleArn,
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: {
+          Effect: 'Allow',
+          Principal: { Service: servicePrincipal },
+          Action: 'sts:AssumeRole'
+        }
+      }
+    })
+    await store.saveOrganizationMetadata(orgId, 'metadata', { rootAccountId: targetAccountId })
+    await store.saveIndex('accounts-to-orgs', { [targetAccountId]: orgId }, '')
+    await store.saveOrganizationMetadata(orgId, 'ous', { 'r-example': { rcps: [] } })
+    await store.saveOrganizationMetadata(orgId, 'accounts', {
+      [targetAccountId]: {
+        ou: 'r-example',
+        rcps: [
+          'arn:aws:organizations::123456789012:policy/o-exampleorg/resource_control_policy/p-deny-assume-role'
+        ]
+      }
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-assume-role', 'metadata', {
+      arn: 'arn:aws:organizations::123456789012:policy/o-exampleorg/resource_control_policy/p-deny-assume-role',
+      name: 'DenyAssumeRole'
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-assume-role', 'policy', {
+      Version: '2012-10-17',
+      Statement: {
+        Effect: 'Deny',
+        Principal: '*',
+        Action: 'sts:AssumeRole',
+        Resource: targetRoleArn
+      }
+    })
+
+    const getRcpHierarchyForAccount = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When the service principal assumes the service-linked role
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: servicePrincipal,
+        resourceArn: targetRoleArn,
+        resourceAccount: targetAccountId,
+        action: 'sts:AssumeRole',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then the RCP is excluded and the role trust policy allows the request
+    expect(result.resultType).toEqual('single')
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('Allowed')
+    expect(getRcpHierarchyForAccount).not.toHaveBeenCalled()
+  })
+
+  it('should apply an RCP when a non-service principal assumes a service-linked role', async () => {
+    //Given a caller role, a service-linked target role, and an RCP on the target account
+    const { store, client } = testStore()
+    const callerAccountId = '123456789012'
+    const targetAccountId = '210987654321'
+    const callerRoleArn = `arn:aws:iam::${callerAccountId}:role/CallerRole`
+    const targetRoleArn = `arn:aws:iam::${targetAccountId}:role/aws-service-role/example.amazonaws.com/AWSServiceRoleForExample`
+    const orgId = 'o-exampleorg'
+
+    await saveRole(store, {
+      arn: callerRoleArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'AllowAssumeRole',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: {
+              Effect: 'Allow',
+              Action: 'sts:AssumeRole',
+              Resource: targetRoleArn
+            }
+          }
+        }
+      ]
+    })
+    await saveRole(store, {
+      arn: targetRoleArn,
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: {
+          Effect: 'Allow',
+          Principal: { AWS: callerRoleArn },
+          Action: 'sts:AssumeRole'
+        }
+      }
+    })
+    await store.saveOrganizationMetadata(orgId, 'metadata', { rootAccountId: callerAccountId })
+    await store.saveIndex('accounts-to-orgs', { [targetAccountId]: orgId }, '')
+    await store.saveOrganizationMetadata(orgId, 'ous', { 'r-example': { rcps: [] } })
+    await store.saveOrganizationMetadata(orgId, 'accounts', {
+      [targetAccountId]: {
+        ou: 'r-example',
+        rcps: [
+          'arn:aws:organizations::123456789012:policy/o-exampleorg/resource_control_policy/p-deny-assume-role'
+        ]
+      }
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-assume-role', 'metadata', {
+      arn: 'arn:aws:organizations::123456789012:policy/o-exampleorg/resource_control_policy/p-deny-assume-role',
+      name: 'DenyAssumeRole'
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-assume-role', 'policy', {
+      Version: '2012-10-17',
+      Statement: {
+        Effect: 'Deny',
+        Principal: '*',
+        Action: 'sts:AssumeRole',
+        Resource: targetRoleArn
+      }
+    })
+
+    //When the non-service principal assumes the service-linked role
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: callerRoleArn,
+        resourceArn: targetRoleArn,
+        resourceAccount: targetAccountId,
+        action: 'sts:AssumeRole',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then the target account RCP explicitly denies the request
+    expect(result.resultType).toEqual('single')
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('ExplicitlyDenied')
+    expect(result.result.analysis.rcpAnalysis?.result).toEqual('ExplicitlyDenied')
+  })
+
+  it('should throw an error if the resource account id cannot be determined', async () => {
+    const { client } = testStore()
+    // Given a request with an unknown resource ARN
+    const req: SimulationRequest = {
+      simulationMode: 'Strict',
+      principal: 'arn:aws:iam::123456789012:user/test-user',
+      resourceArn: 'arn:aws:s3:::unknown-bucket',
+      resourceAccount: undefined,
+      action: 's3:GetObject',
+      customContextKeys: {}
+    }
+    //When simulating the request
+    // Then it should throw an error indicating the account ID cannot be found
+    await expect(simulateRequest(req, client)).rejects.toThrow(
+      /Unable to find account ID for resource/
+    )
+  })
+
+  it('should not mutate the caller request when deriving the resource account', async () => {
+    //Given a collected user request whose resource account is derived from the ARN
+    const { store, client } = testStore()
+    const principal = 'arn:aws:iam::123456789012:user/test-user'
+    await saveUser(store, {
+      arn: principal,
+      inlinePolicies: [
+        {
+          PolicyName: 'ReadTable',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: {
+              Effect: 'Allow',
+              Action: 'dynamodb:GetItem',
+              Resource: '*'
+            }
+          }
+        }
+      ]
+    })
+    const request: SimulationRequest = {
+      simulationMode: 'Strict',
+      principal,
+      resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/example',
+      resourceAccount: undefined,
+      action: 'dynamodb:GetItem',
+      customContextKeys: {}
+    }
+
+    //When simulating the request
+    const response = await simulateRequest(request, client)
+
+    //Then the normalized output should have the account without mutating the caller input
+    expect(response.request.resource.accountId).toBe('123456789012')
+    expect(request.resourceAccount).toBeUndefined()
+  })
+
+  it('should throw an error if the action service cannot be found', async () => {
+    const { client } = testStore()
+    // Given a request with an unknown action service
+    const req: SimulationRequest = {
+      simulationMode: 'Strict',
+      principal: 'arn:aws:iam::123456789012:user/test-user',
+      resourceArn: 'arn:aws:iam::123456789012:test-bucket',
+      resourceAccount: '123456789012',
+      action: 'unknown:action',
+      customContextKeys: {}
+    }
+
+    // When simulating the request
+    // Then it should throw an error indicating the action service cannot be found
+    await expect(simulateRequest(req, client)).rejects.toThrow(
+      /Unable to find action details for unknown:action/
+    )
+  })
+
+  it('should throw an error if the action details cannot be found', async () => {
+    const { client } = testStore()
+    const req: SimulationRequest = {
+      simulationMode: 'Strict',
+      principal: 'arn:aws:iam::123456789012:user/test-user',
+      resourceArn: 'arn:aws:iam::123456789012:test-bucket',
+      resourceAccount: '123456789012',
+      action: 's3:fakeaction',
+      customContextKeys: {}
+    }
+    await expect(simulateRequest(req, client)).rejects.toThrow(
+      /Unable to find action details for s3:fakeaction/
+    )
+  })
+
+  it('should use underlying role tags for assumed-role session principals', async () => {
+    //Given an assumed-role session whose role has a tag-gated identity policy
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+    const sessionArn = 'arn:aws:sts::123456789012:assumed-role/TestRole/TestSession'
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'AllowTaggedRoleAccess',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: [
+              {
+                Effect: 'Allow',
+                Action: 's3:GetObject',
+                Resource: 'arn:aws:s3:::example-bucket/*',
+                Condition: {
+                  StringEquals: {
+                    'aws:PrincipalTag/Department': 'Engineering'
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })
+    await store.saveResourceMetadata('123456789012', roleArn, 'tags', {
+      Department: 'Engineering'
+    })
+
+    //When simulating as the assumed-role session
+    const { request, result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: sessionArn,
+        resourceArn: 'arn:aws:s3:::example-bucket/private.txt',
+        resourceAccount: '123456789012',
+        action: 's3:GetObject',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then the simulation should preserve the session principal but use role-backed context
+    expect(request.principal).toBe(sessionArn)
+    expect(request.contextVariables['aws:PrincipalArn']).toBe(roleArn)
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('Allowed')
+  })
+
+  it('should use canonical path-qualified role tags for pathless assumed-role session principals', async () => {
+    //Given a pathless assumed-role session whose collected IAM role has a path
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/TestRole'
+    const sessionArn = 'arn:aws:sts::123456789012:assumed-role/TestRole/TestSession'
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'AllowTaggedPathRoleAccess',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: [
+              {
+                Effect: 'Allow',
+                Action: 's3:GetObject',
+                Resource: 'arn:aws:s3:::example-bucket/*',
+                Condition: {
+                  StringEquals: {
+                    'aws:PrincipalTag/Department': 'Engineering'
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })
+    await store.saveResourceMetadata('123456789012', roleArn, 'tags', {
+      Department: 'Engineering'
+    })
+
+    //When simulating as the assumed-role session
+    const { request, result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: sessionArn,
+        resourceArn: 'arn:aws:s3:::example-bucket/private.txt',
+        resourceAccount: '123456789012',
+        action: 's3:GetObject',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then context keys should use the canonical collected role ARN and its tags
+    expect(request.principal).toBe(sessionArn)
+    expect(request.contextVariables['aws:PrincipalArn']).toBe(roleArn)
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('Allowed')
+  })
+
+  it('should return structured validation errors for invalid trust policies', async () => {
+    const { store, client } = testStore()
+    const principalArn = 'arn:aws:iam::123456789012:user/test-user'
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+
+    await saveUser(store, { arn: principalArn })
+    await saveRole(store, {
+      arn: roleArn,
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Action: 'sts:AssumeRole'
+          }
+        ]
+      }
+    })
+
+    const { request, result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: roleArn,
+        resourceAccount: '123456789012',
+        action: 'sts:AssumeRole',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    expect(request).toMatchObject({
+      action: 'sts:AssumeRole',
+      principal: principalArn,
+      resource: {
+        resource: roleArn,
+        accountId: '123456789012'
+      }
+    })
+    expect(result.resultType).toBe('error')
+    if (result.resultType !== 'error') {
+      assert.fail(`Expected error result type, got ${result.resultType}`)
+    }
+
+    expect(result.errors.message).toBe('policy.errors')
+    expect(result.errors.resourcePolicyErrors).toEqual([
+      {
+        path: 'Statement[0]',
+        message: 'One of Principal or NotPrincipal is required in a trust policy'
+      }
+    ])
+  })
+
+  it('should reject an assume-role request to a collected role without a trust policy', async () => {
+    //Given a collected caller and a collected target role that has no stored trust policy
+    const { store, client } = testStore()
+    const principalArn = 'arn:aws:iam::123456789012:user/test-user'
+    const roleArn = 'arn:aws:iam::123456789012:role/NoTrustPolicyRole'
+    await saveUser(store, { arn: principalArn })
+    await saveRole(store, { arn: roleArn })
+
+    //When simulating sts:AssumeRole against the role
+    const simulation = simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: roleArn,
+        resourceAccount: '123456789012',
+        action: 'sts:AssumeRole',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then the missing trust policy is rejected before policy evaluation
+    await expect(simulation).rejects.toThrow(
+      `Trust policy not found for resource ${roleArn}. sts assume role actions require a trust policy.`
+    )
+  })
+})
+
+describe('RCP simulation exclusions', () => {
+  const accountId = '123456789012'
+  const principalArn = `arn:aws:iam::${accountId}:user/test-user`
+  const keyArn = `arn:aws:kms:us-east-1:${accountId}:key/test-key`
+
+  it('should omit RCPs for a case-insensitive kms:RetireGrant action', async () => {
+    //Given a KMS request with a customer-managed key and an RCP hierarchy spy
+    const { store, client } = testStore()
+    await saveUser(store, { arn: principalArn })
+    await store.saveResourceMetadata(accountId, keyArn, 'metadata', { awsManaged: false })
+    const rcpHierarchySpy = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When simulating a mixed-case kms:RetireGrant action
+    await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: keyArn,
+        resourceAccount: accountId,
+        action: 'KMS:retiregrant',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then only the principal RCP hierarchy should be requested
+    expect(rcpHierarchySpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('should omit RCPs for an AWS-managed KMS key', async () => {
+    //Given a non-RetireGrant KMS request targeting an AWS-managed key
+    const { store, client } = testStore()
+    await saveUser(store, { arn: principalArn })
+    await store.saveResourceMetadata(accountId, keyArn, 'metadata', { awsManaged: true })
+    const rcpHierarchySpy = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When simulating the request
+    await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: keyArn,
+        resourceAccount: accountId,
+        action: 'kms:Decrypt',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then only the principal RCP hierarchy should be requested
+    expect(rcpHierarchySpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('should include RCPs when KMS key management metadata is missing', async () => {
+    //Given a non-RetireGrant KMS request without key management metadata
+    const { store, client } = testStore()
+    await saveUser(store, { arn: principalArn })
+    const rcpHierarchySpy = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When simulating the request
+    await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: keyArn,
+        resourceAccount: accountId,
+        action: 'kms:Decrypt',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then both the principal and resource RCP hierarchies should be requested
+    expect(rcpHierarchySpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('should include RCPs for a customer-managed KMS key and other KMS actions', async () => {
+    //Given a non-RetireGrant KMS request targeting a customer-managed key
+    const { store, client } = testStore()
+    await saveUser(store, { arn: principalArn })
+    await store.saveResourceMetadata(accountId, keyArn, 'metadata', { awsManaged: false })
+    const rcpHierarchySpy = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When simulating the request
+    await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: principalArn,
+        resourceArn: keyArn,
+        resourceAccount: accountId,
+        action: 'kms:Decrypt',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then both the principal and resource RCP hierarchies should be requested
+    expect(rcpHierarchySpy).toHaveBeenCalledTimes(2)
+    expect(rcpHierarchySpy).toHaveBeenCalledWith(accountId)
+  })
+})
+
+describe('role session-tag Discovery constraints', () => {
+  const accountId = '123456789012'
+  const tableArn = `arn:aws:dynamodb:us-east-1:${accountId}:table/tagged-table`
+
+  /**
+   * Creates a principal-tag-gated identity policy.
+   *
+   * @param tagKey the principal tag required by the policy
+   * @returns inline-policy metadata accepted by the test store
+   */
+  function taggedAccessPolicy(tagKey: string) {
+    return [
+      {
+        PolicyName: 'TaggedTableAccess',
+        PolicyDocument: {
+          Version: '2012-10-17',
+          Statement: [
+            {
+              Effect: 'Allow',
+              Action: 'dynamodb:GetItem',
+              Resource: tableArn,
+              Condition: { StringEquals: { [`aws:PrincipalTag/${tagKey}`]: 'Engineering' } }
+            }
+          ]
+        }
+      }
+    ]
+  }
+
+  /**
+   * Runs a Discovery simulation for a principal-tag-gated request.
+   *
+   * @param principal the role, role session, or user to simulate
+   * @param client the synthetic collect client
+   * @param customContextKeys optional authoritative caller context
+   * @returns the simulation result
+   */
+  async function runDiscovery(
+    principal: string,
+    client: ReturnType<typeof testStore>['client'],
+    customContextKeys: Record<string, string | string[]> = {}
+  ) {
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal,
+        resourceArn: tableArn,
+        resourceAccount: accountId,
+        action: 'dynamodb:GetItem',
+        customContextKeys
+      },
+      client
+    )
+    return result
+  }
+
+  /**
+   * Runs a Discovery simulation and returns its allowed single-resource analysis.
+   *
+   * @param principal the role, role session, or user to simulate
+   * @param client the synthetic collect client
+   * @param customContextKeys optional authoritative caller context
+   * @returns the successful request analysis
+   */
+  async function discoveryAnalysis(
+    principal: string,
+    client: ReturnType<typeof testStore>['client'],
+    customContextKeys: Record<string, string | string[]> = {}
+  ) {
+    const result = await runDiscovery(principal, client, customContextKeys)
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('Allowed')
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected single result type, got ${result.resultType}`)
+    }
+    return result.result.analysis
+  }
+
+  it('evaluates a Unicode-equivalent custom tag override as authoritative', async () => {
+    //Given a stored role tag and an identity policy using ordinary sigma
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UnicodeTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('σ'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 'sts:AssumeRole' }]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { σ: 'Other' })
+
+    //When a caller overrides the same tag using final sigma
+    const analysis = await discoveryAnalysis(roleArn, client, {
+      'aws:PrincipalTag/ς': 'Engineering'
+    })
+
+    //Then the override satisfies the condition without leaving it unresolved
+    expect(analysis.result).toBe('Allowed')
+    expect(analysis.ignoredConditions?.identity?.allow).toBeUndefined()
+
+    //And a nonmatching override must not grant access
+    const nonmatching = await runDiscovery(roleArn, client, { 'aws:PrincipalTag/ς': 'Finance' })
+    expect(nonmatching.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('keeps stored role tags strict without a TagSession Allow', async () => {
+    //Given a tagged role whose trust policy only permits AssumeRole
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/StaticTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 'sts:AssumeRole' }]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { Department: 'Engineering' })
+
+    //When simulating the matching tag-gated request
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then the stored role tag proves unconditional access
+    expect(analysis.conditions).toBeUndefined()
+    expect(analysis.ignoredConditions?.identity?.allow).toBeUndefined()
+  })
+
+  it('treats an absent immutable role tag as authoritatively absent', async () => {
+    //Given an untagged role that cannot receive session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UntaggedStaticRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 'sts:AssumeRole' }]
+      }
+    })
+
+    //When simulating access that requires the absent tag
+    const result = await runDiscovery(roleArn, client)
+
+    //Then known absence prevents the conditional Allow from applying
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('returns conditional access for an absent tag that an unrestricted session may supply', async () => {
+    //Given an untagged role whose trust policy permits arbitrary session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UntaggedDynamicRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Principal: '*', Action: ['sts:AssumeRole', 'sts:TagSession'] }
+        ]
+      }
+    })
+
+    //When simulating access that requires the potentially supplied tag
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then both presence and value remain conditional
+    expect(analysis.conditions).toEqual(
+      expect.objectContaining({ key: 'aws:PrincipalTag/Department' })
+    )
+  })
+
+  it('documents the stored-tag alias limitation for distinct IAM string values', async () => {
+    //Given a role whose trust policy permits a tag name equivalent to the stored context key
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UnicodeAliasRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('i'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: ['sts:AssumeRole', 'sts:TagSession'],
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['İ'] } }
+          }
+        ]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { i: 'Other' })
+
+    //When discovering access using the collected role tag
+    const result = await runDiscovery(roleArn, client)
+
+    //Then the current value-based matching keeps the stored value authoritative
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('returns conditional access for an unrestricted TagSession Allow', async () => {
+    //Given a tagged role whose trust policy permits arbitrary session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/DynamicTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Principal: '*', Action: ['sts:AssumeRole', 'sts:TagSession'] }
+        ]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { Department: 'Engineering' })
+
+    //When simulating the matching tag-gated request
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then access retains the PrincipalTag condition because a session can override its value
+    expect(analysis.conditions).toEqual(
+      expect.objectContaining({
+        conditionType: 'condition',
+        op: 'StringEquals',
+        key: 'aws:PrincipalTag/Department',
+        values: ['Engineering']
+      })
+    )
+    expect(analysis.ignoredConditions?.identity?.allow).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'aws:PrincipalTag/Department', op: 'StringEquals' })
+      ])
+    )
+  })
+
+  it('does not change Strict-mode evaluation for a role with mutable session tags', async () => {
+    //Given a tagged role whose trust policy permits arbitrary session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/StrictDynamicTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          { Effect: 'Allow', Principal: '*', Action: ['sts:AssumeRole', 'sts:TagSession'] }
+        ]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { Department: 'Engineering' })
+
+    //When evaluating the same request in Strict mode
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: roleArn,
+        resourceArn: tableArn,
+        resourceAccount: accountId,
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then the stored value remains authoritative and access is unconditional
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('Allowed')
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected single result type, got ${result.resultType}`)
+    }
+    expect(result.result.analysis.conditions).toBeUndefined()
+  })
+
+  it('keeps a stored role tag strict when a ForAll TagKeys allowlist excludes it', async () => {
+    //Given a trust policy that allows only an unrelated session-tag key
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/LimitedTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: 'sts:TagSession',
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': 'Environment' } }
+          }
+        ]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { Department: 'Engineering' })
+
+    //When simulating the matching tag-gated request
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then the Department role tag remains authoritative
+    expect(analysis.conditions).toBeUndefined()
+  })
+
+  it('treats an absent tag outside a ForAll TagKeys allowlist as authoritatively absent', async () => {
+    //Given an untagged role whose sessions may only supply Environment
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UntaggedLimitedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: ['sts:AssumeRole', 'sts:TagSession'],
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': 'Environment' } }
+          }
+        ]
+      }
+    })
+
+    //When simulating access that requires absent Department
+    const result = await runDiscovery(roleArn, client)
+
+    //Then Department is immutable and known absent
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('returns conditional access for an absent tag inside a ForAll TagKeys allowlist', async () => {
+    //Given an untagged role whose sessions may supply Department
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UntaggedAllowlistedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: ['sts:AssumeRole', 'sts:TagSession'],
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': 'Department' } }
+          }
+        ]
+      }
+    })
+
+    //When simulating access that requires potentially supplied Department
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then Department presence and value remain conditional
+    expect(analysis.conditions).toEqual(
+      expect.objectContaining({ key: 'aws:PrincipalTag/Department' })
+    )
+  })
+
+  it('unions different ForAll TagKeys allowlists across TagSession Allows', async () => {
+    //Given separate TagSession paths that permit Department and Environment
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/UnionTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Environment'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: 'sts:TagSession',
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': 'Department' } }
+          },
+          {
+            Effect: 'Allow',
+            Principal: '*',
+            Action: 'sts:TagSession',
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': 'Environment' } }
+          }
+        ]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', {
+      Department: 'Engineering',
+      Environment: 'Engineering'
+    })
+
+    //When simulating access gated by the second statement's tag key
+    const analysis = await discoveryAnalysis(roleArn, client)
+
+    //Then Environment is mutable through the union of possible TagSession paths
+    expect(analysis.conditions).toEqual(
+      expect.objectContaining({ key: 'aws:PrincipalTag/Environment' })
+    )
+  })
+
+  it('uses the canonical role trust policy for an assumed-role session', async () => {
+    //Given an assumed-role session whose underlying role permits arbitrary session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/SessionTaggedRole`
+    const sessionArn = `arn:aws:sts::${accountId}:assumed-role/SessionTaggedRole/session`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 'sts:TagSession' }]
+      }
+    })
+    await store.saveResourceMetadata(accountId, roleArn, 'tags', { Department: 'Engineering' })
+
+    //When simulating as the session ARN
+    const analysis = await discoveryAnalysis(sessionArn, client)
+
+    //Then the underlying role's trust policy makes the tag value conditional
+    expect(analysis.conditions).toEqual(
+      expect.objectContaining({ key: 'aws:PrincipalTag/Department' })
+    )
+  })
+
+  it('treats an explicit custom value as authoritative even when the role tag is mutable', async () => {
+    //Given an untagged role that permits arbitrary session tags
+    const { store, client } = testStore()
+    const roleArn = `arn:aws:iam::${accountId}:role/CustomTaggedRole`
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: taggedAccessPolicy('Department'),
+      trustPolicy: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Principal: '*', Action: 'sts:TagSession' }]
+      }
+    })
+
+    //When the caller explicitly supplies the matching PrincipalTag value
+    const analysis = await discoveryAnalysis(roleArn, client, {
+      'aws:PrincipalTag/Department': 'Engineering'
+    })
+
+    //Then the caller-provided value is strict rather than session-conditional
+    expect(analysis.conditions).toBeUndefined()
+  })
+
+  it('keeps IAM user tags strict in Discovery mode', async () => {
+    //Given a user with a stored tag and matching tag-gated access
+    const { store, client } = testStore()
+    const userArn = `arn:aws:iam::${accountId}:user/TaggedUser`
+    await saveUser(store, { arn: userArn, inlinePolicies: taggedAccessPolicy('Department') })
+    await store.saveResourceMetadata(accountId, userArn, 'tags', { Department: 'Engineering' })
+
+    //When simulating the request as the user
+    const analysis = await discoveryAnalysis(userArn, client)
+
+    //Then user tags remain authoritative because users cannot receive role-session tags
+    expect(analysis.conditions).toBeUndefined()
+    expect(analysis.ignoredConditions?.identity?.allow).toBeUndefined()
+  })
+
+  it('treats an absent IAM user tag as authoritatively absent', async () => {
+    //Given an untagged IAM user with tag-gated access
+    const { store, client } = testStore()
+    const userArn = `arn:aws:iam::${accountId}:user/UntaggedUser`
+    await saveUser(store, { arn: userArn, inlinePolicies: taggedAccessPolicy('Department') })
+
+    //When simulating access that requires the absent tag
+    const result = await runDiscovery(userArn, client)
+
+    //Then user-tag absence is strict because users cannot receive session tags
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+})
+
+describe('aws:userid context-key certainty behavior', () => {
+  const useridConditionPolicy = [
+    {
+      PolicyName: 'ConditionalAccess',
+      PolicyDocument: {
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Action: 'dynamodb:GetItem',
+            Resource: '*',
+            Condition: {
+              StringLike: { 'aws:userid': '*:expected-session' }
+            }
+          }
+        ]
+      }
+    }
+  ]
+
+  it('should not treat aws:userid as strict for role principals in Discovery mode', async () => {
+    //Given a role whose only Allow is gated by an aws:userid condition
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: useridConditionPolicy
+    })
+
+    //When simulating in Discovery mode as the role
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal: roleArn,
+        resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/my-table',
+        resourceAccount: '123456789012',
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    //Then access should be allowed because aws:userid is not strict for roles
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('Allowed')
+
+    //And aws:userid should be reported as an ignored condition on the identity allow
+    if (result.resultType === 'single') {
+      const ignoredConditions = result.result.analysis.ignoredConditions
+      expect(ignoredConditions?.identity?.allow).toEqual(
+        expect.arrayContaining([expect.objectContaining({ key: 'aws:userid' })])
+      )
+    } else {
+      assert.fail(`Expected single result type, got ${result.resultType}`)
+    }
+  })
+
+  it('should treat aws:userid as strict for user principals in Discovery mode', async () => {
+    //Given a user whose only Allow is gated by an aws:userid condition
+    const { store, client } = testStore()
+    const userArn = 'arn:aws:iam::123456789012:user/TestUser'
+    await saveUser(store, {
+      arn: userArn,
+      inlinePolicies: useridConditionPolicy
+    })
+
+    //When simulating in Discovery mode as the user
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal: userArn,
+        resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/my-table',
+        resourceAccount: '123456789012',
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    //Then access should be denied because aws:userid is strict and the value doesn't match
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('should treat aws:userid as strict for assumed-role session principals in Discovery mode', async () => {
+    //Given a role whose only Allow is gated by an aws:userid condition
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+    await saveRole(store, { arn: roleArn, inlinePolicies: useridConditionPolicy })
+
+    //And an assumed-role session ARN whose session name does not match the condition
+    const sessionArn = 'arn:aws:sts::123456789012:assumed-role/TestRole/wrong-session'
+
+    //When simulating in Discovery mode as the session
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal: sessionArn,
+        resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/my-table',
+        resourceAccount: '123456789012',
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    //Then access should be denied because aws:userid is strict for sessions and the value doesn't match
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('should allow assumed-role session when aws:userid condition matches in Discovery mode', async () => {
+    //Given a role whose only Allow is gated by an aws:userid condition
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+    await saveRole(store, { arn: roleArn, inlinePolicies: useridConditionPolicy })
+
+    //And an assumed-role session ARN whose session name matches the condition
+    const sessionArn = 'arn:aws:sts::123456789012:assumed-role/TestRole/expected-session'
+
+    //When simulating in Discovery mode as the session
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal: sessionArn,
+        resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/my-table',
+        resourceAccount: '123456789012',
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    //Then access should be allowed because the userid matches
+    expect(result.overallResult).toBe('Allowed')
+  })
+
+  it('should allow assumed-role session when aws:userid condition matches in Strict mode', async () => {
+    //Given a role whose only Allow is gated by an aws:userid condition
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/TestRole'
+    await saveRole(store, { arn: roleArn, inlinePolicies: useridConditionPolicy })
+
+    //And an assumed-role session ARN whose session name matches the condition
+    const sessionArn = 'arn:aws:sts::123456789012:assumed-role/TestRole/expected-session'
+
+    //When simulating in Strict mode as the session
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Strict',
+        principal: sessionArn,
+        resourceArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/my-table',
+        resourceAccount: '123456789012',
+        action: 'dynamodb:GetItem',
+        customContextKeys: {}
+      },
+      client
+    )
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    //Then access should be allowed because the userid matches the condition
+    expect(result.overallResult).toBe('Allowed')
+  })
+})
+
+describe('caller-provided Discovery context keys', () => {
+  it('should evaluate a caller-provided SourceVpc value exactly', async () => {
+    // Given a role whose Allow requires a specific source VPC
+    const { store, client } = testStore()
+    const roleArn = 'arn:aws:iam::123456789012:role/VpcRole'
+    await saveRole(store, {
+      arn: roleArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'SourceVpcAccess',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: [
+              {
+                Effect: 'Allow',
+                Action: 's3:ListBucket',
+                Resource: '*',
+                Condition: {
+                  StringEquals: {
+                    'aws:SourceVpc': 'vpc-expected'
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })
+
+    // When simulating with a caller-provided nonmatching source VPC in Discovery mode
+    const { result } = await simulateRequest(
+      {
+        simulationMode: 'Discovery',
+        principal: roleArn,
+        resourceArn: 'arn:aws:s3:::example-bucket',
+        resourceAccount: '123456789012',
+        action: 's3:ListBucket',
+        customContextKeys: {
+          'aws:SourceVpc': 'vpc-other'
+        }
+      },
+      client
+    )
+
+    // Then the precise caller value should make the conditional Allow not apply
+    if (result.resultType === 'error') {
+      assert.fail(`Simulation resulted in error: ${result.errors.message}`)
+    }
+    expect(result.overallResult).toBe('ImplicitlyDenied')
+  })
+
+  it('should treat generated keys as authoritatively absent for anonymous requests', () => {
+    //Given an anonymous Discovery request without principal or service-source context
+    const request = {
+      simulationMode: 'Discovery' as const,
+      principal: undefined,
+      customContextKeys: {}
+    }
+
+    //When resolving constraints for context keys that anonymous requests cannot supply
+    const constraints = [
+      'aws:PrincipalArn',
+      'aws:PrincipalAccount',
+      'aws:PrincipalOrgPaths',
+      'aws:PrincipalOrgID',
+      'aws:PrincipalIsAWSService',
+      'aws:PrincipalServiceName',
+      'aws:username',
+      'aws:userid',
+      'aws:SourceArn',
+      'kms:CallerAccount',
+      '/^aws:PrincipalTag\/.*/',
+      ...anonymousKnownAbsentContextKeyNames
+    ].map((keyName) => discoveryConstraintForGeneratedKey(keyName, request))
+
+    //Then their absence and values should be authoritative
+    expect(constraints).toEqual([
+      { keyName: 'aws:PrincipalArn', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:PrincipalAccount', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:PrincipalOrgPaths', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:PrincipalOrgID', presenceIsKnown: true, valueIsKnown: true },
+      {
+        keyName: 'aws:PrincipalIsAWSService',
+        presenceIsKnown: true,
+        valueIsKnown: true
+      },
+      {
+        keyName: 'aws:PrincipalServiceName',
+        presenceIsKnown: true,
+        valueIsKnown: true
+      },
+      { keyName: 'aws:username', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:userid', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:SourceArn', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'kms:CallerAccount', presenceIsKnown: true, valueIsKnown: true },
+      {
+        keyName: '/^aws:PrincipalTag\/.*/',
+        presenceIsKnown: true,
+        valueIsKnown: true
+      },
+      ...anonymousKnownAbsentContextKeyNames.map((keyName) => ({
+        keyName,
+        presenceIsKnown: true,
+        valueIsKnown: true
+      }))
+    ])
+  })
+
+  it('should treat a caller-provided KMS caller account as known', () => {
+    // Given a Discovery service-principal request with an alternate-case caller account
+    const request: SimulationRequest = {
+      simulationMode: 'Discovery',
+      principal: 'ecr.amazonaws.com',
+      resourceArn: 'arn:aws:kms:us-east-1:123456789012:key/example',
+      resourceAccount: '123456789012',
+      action: 'kms:Encrypt',
+      customContextKeys: {
+        'KMS:calleraccount': '999999999999'
+      }
+    }
+
+    // When resolving the constraint for the canonical key spelling
+    const constraint = discoveryConstraintForGeneratedKey('kms:CallerAccount', request)
+
+    // Then the caller-supplied value should be authoritative
+    expect(constraint).toEqual({
+      keyName: 'kms:CallerAccount',
+      presenceIsKnown: true,
+      valueIsKnown: true
+    })
+  })
+
+  it('should treat a mutable stored PrincipalTag as known present with an unknown value', () => {
+    //Given a stored PrincipalTag that the role session may override
+    const keyName = 'aws:PrincipalTag/Department'
+    const request = {
+      simulationMode: 'Discovery' as const,
+      principal: 'arn:aws:iam::123456789012:role/TaggedRole',
+      customContextKeys: {}
+    }
+
+    //When resolving its Discovery constraint
+    const constraint = discoveryConstraintForGeneratedKey(keyName, request, new Set([keyName]))
+
+    //Then its baseline presence is known but its effective value is not
+    expect(constraint).toEqual({ keyName, presenceIsKnown: true, valueIsKnown: false })
+  })
+})
+
+describe('mergeDiscoveryContextKeyConstraints', () => {
+  it('should replace matching generated literal and regex constraints case-insensitively', () => {
+    //Given generated literal and regex constraints with matching caller overrides
+    const generatedConstraints = [
+      { keyName: 'aws:SourceVpc', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: '/^aws:PrincipalTag\\/.*/', presenceIsKnown: true, valueIsKnown: true },
+      { keyName: 'aws:SecureTransport', presenceIsKnown: true, valueIsKnown: true }
+    ] as const
+    const callerConstraints = [
+      { keyName: 'AWS:sourcevpc', presenceIsKnown: true, valueIsKnown: false },
+      { keyName: '/^AWS:PrincipalTag\\/.*/', presenceIsKnown: false, valueIsKnown: false }
+    ] as const
+
+    //When constraints are merged
+    const result = mergeDiscoveryContextKeyConstraints(
+      [...generatedConstraints],
+      [...callerConstraints]
+    )
+
+    //Then caller constraints should precede remaining generated constraints
+    expect(result).toEqual([
+      ...callerConstraints,
+      { keyName: 'aws:SecureTransport', presenceIsKnown: true, valueIsKnown: true }
+    ])
+  })
+
+  it('should retain a generated regex when the caller constraint has different text', () => {
+    //Given a generated tag pattern and a caller literal that would match that pattern
+    const generatedConstraints = [
+      { keyName: '/^aws:ResourceTag\\/.*/', presenceIsKnown: true, valueIsKnown: true }
+    ]
+    const callerConstraints = [
+      { keyName: 'AWS:ResourceTag/Environment', presenceIsKnown: false, valueIsKnown: false }
+    ]
+
+    //When constraints are merged
+    const result = mergeDiscoveryContextKeyConstraints(generatedConstraints, callerConstraints)
+
+    //Then lexical matching should retain the different generated pattern after the caller constraint
+    expect(result).toEqual([...callerConstraints, ...generatedConstraints])
+  })
+})
+
+describe('resultMatchesExpectation', () => {
+  it('should return true if the expected result is undefined', () => {
+    //Given an expected result of undefined
+    const expected = undefined
+
+    //When checking against any actual result
+    const result = resultMatchesExpectation(expected, 'Allowed')
+
+    //Then it should return true
+    expect(result).toBe(true)
+  })
+  it('should return true if the expected result matches the actual result', () => {
+    //Given a set of expected values
+    const expectedValues = ['Allowed', 'ExplicitlyDeny', 'ImplicitlyDeny'] as EvaluationResult[]
+
+    //When checking against each expected value
+    const actualValues = expectedValues.map((expected) => {
+      return resultMatchesExpectation(expected, expected)
+    })
+
+    //Then it should return true for each match
+    expect(actualValues).toEqual(expectedValues.map(() => true))
+  })
+  it('should return true if AnyDeny is expected and the actual result is ImplicitlyDeny', () => {
+    // Given AnyDeny as the expected result
+    const expected = 'AnyDeny'
+
+    // When checking against ImplicitlyDeny
+    const result = resultMatchesExpectation(expected, 'ImplicitlyDenied')
+
+    // Then it should return true
+    expect(result).toBe(true)
+  })
+
+  it('should return true if AnyDeny is expected and the actual result is ExplicitlyDeny', () => {
+    // Given AnyDeny as the expected result
+    const expected = 'AnyDeny'
+
+    // When checking against ExplicitlyDenied
+    const result = resultMatchesExpectation(expected, 'ExplicitlyDenied')
+
+    // Then it should return true
+    expect(result).toBe(true)
+  })
+})
+
+describe('simulateVirtualResourceRequest', () => {
+  const orgId = 'o-virtualres'
+  const managementAccountId = '100000000000'
+  const principalAccountId = '123456789012'
+  const memberAccountId = '210987654321'
+  const workloadsOuId = 'ou-virtualres-workloads'
+  const principalArn = `arn:aws:iam::${principalAccountId}:role/Reader`
+  const objectArn = (resourceAccount: string) =>
+    `arn:aws:kms:us-east-1:${resourceAccount}:key/uncollected-key`
+  const denyReadRcpArn = `arn:aws:organizations::${managementAccountId}:policy/${orgId}/resource_control_policy/p-deny-kms-describe`
+
+  /**
+   * Store a collected reader role and an organization whose workloads OU denies KMS key descriptions through an
+   * RCP. The member account is placed in that OU but has no collected resources.
+   *
+   * @returns the in-memory collect client for the scenario
+   */
+  async function organizationWithOuRcp() {
+    const { store, client } = testStore()
+    await saveRole(store, {
+      arn: principalArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'ReadObjects',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: { Effect: 'Allow', Action: 'kms:DescribeKey', Resource: '*' }
+          }
+        }
+      ]
+    })
+    await store.saveIndex(
+      'accounts-to-orgs',
+      { [managementAccountId]: orgId, [memberAccountId]: orgId },
+      ''
+    )
+    await store.saveOrganizationMetadata(orgId, 'metadata', {
+      rootAccountId: managementAccountId
+    })
+    await store.saveOrganizationMetadata(orgId, 'ous', {
+      'r-virtualres': { rcps: [] },
+      [workloadsOuId]: { parent: 'r-virtualres', rcps: [denyReadRcpArn] }
+    })
+    await store.saveOrganizationMetadata(orgId, 'accounts', {
+      [managementAccountId]: { ou: 'r-virtualres', rcps: [] },
+      [memberAccountId]: { ou: workloadsOuId, rcps: [] }
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-kms-describe', 'metadata', {
+      arn: denyReadRcpArn,
+      name: 'DenyKmsDescribe'
+    })
+    await store.saveOrganizationPolicyMetadata(orgId, 'rcps', 'p-deny-kms-describe', 'policy', {
+      Version: '2012-10-17',
+      Statement: {
+        Sid: 'DenyKmsDescribe',
+        Effect: 'Deny',
+        Principal: '*',
+        Action: 'kms:DescribeKey',
+        Resource: '*'
+      }
+    })
+    return client
+  }
+
+  /**
+   * Build a virtual-resource read request for the scenario's reader role.
+   *
+   * @param resourceAccount the account encoded in the uncollected resource ARN
+   * @returns the virtual-resource request
+   */
+  function readRequest(resourceAccount: string): VirtualResourceSimulationRequest {
+    return {
+      simulationMode: 'Strict',
+      principal: principalArn,
+      resourceArn: objectArn(resourceAccount),
+      resourceAccount: undefined,
+      action: 'kms:DescribeKey',
+      customContextKeys: {}
+    }
+  }
+
+  it('should apply an RCP on the OU of the uncollected resource account', async () => {
+    //Given an uncollected object in a member account whose OU has a deny RCP
+    const client = await organizationWithOuRcp()
+
+    //When simulating the read as a virtual resource
+    const { result } = await simulateVirtualResourceRequest(readRequest(memberAccountId), client)
+
+    //Then the OU RCP explicitly denies the request
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('ExplicitlyDenied')
+    expect(result.result.analysis.rcpAnalysis?.result).toEqual('ExplicitlyDenied')
+    expect(result.result.analysis.resourceAnalysis?.result).toEqual('Allowed')
+  })
+
+  it('should allow the same request as an external resource, which applies no RCPs', async () => {
+    //Given the same uncollected object in a member account whose OU has a deny RCP
+    const client = await organizationWithOuRcp()
+
+    //When simulating the read as an external resource
+    const { result } = await simulateExternalResourceRequest(
+      { ...readRequest(memberAccountId), resourceAccount: memberAccountId },
+      client
+    )
+
+    //Then the OU RCP is ignored and the synthetic resource policy allows the request
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('Allowed')
+  })
+
+  it('should apply no RCPs when the resource account is outside the organization data', async () => {
+    //Given an uncollected object in an account absent from accounts-to-orgs
+    const client = await organizationWithOuRcp()
+    const outsideAccountId = '555555555555'
+    const rcpHierarchySpy = vi.spyOn(client, 'getRcpHierarchyForAccount')
+
+    //When simulating the read as a virtual resource
+    const { result } = await simulateVirtualResourceRequest(readRequest(outsideAccountId), client)
+
+    //Then the account's empty RCP hierarchy lets the request through
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('Allowed')
+    expect(rcpHierarchySpy).toHaveBeenCalledWith(outsideAccountId)
+    await expect(client.getRcpHierarchyForAccount(outsideAccountId)).resolves.toEqual([])
+  })
+
+  it('should not apply the OU RCP to a service-linked role principal', async () => {
+    //Given a collected service-linked role that may read objects and the OU deny RCP
+    const client = await organizationWithOuRcp()
+    const serviceLinkedRoleArn = `arn:aws:iam::${principalAccountId}:role/aws-service-role/example.amazonaws.com/AWSServiceRoleForExample`
+    await saveRole(client.getStore(), {
+      arn: serviceLinkedRoleArn,
+      inlinePolicies: [
+        {
+          PolicyName: 'ReadObjects',
+          PolicyDocument: {
+            Version: '2012-10-17',
+            Statement: { Effect: 'Allow', Action: 'kms:DescribeKey', Resource: '*' }
+          }
+        }
+      ]
+    })
+
+    //When the service-linked role reads the virtual resource
+    const { result } = await simulateVirtualResourceRequest(
+      { ...readRequest(memberAccountId), principal: serviceLinkedRoleArn },
+      client
+    )
+
+    //Then RCPs do not apply and the request is allowed
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(result.overallResult).toEqual('Allowed')
+  })
+
+  it('should prefer a supplied resource account over the ARN account', async () => {
+    //Given an ARN for an account with an RCP deny and a supplied outside-organization account
+    const client = await organizationWithOuRcp()
+    const outsideAccountId = '555555555555'
+    const request = { ...readRequest(memberAccountId), resourceAccount: outsideAccountId }
+
+    //When simulating the virtual resource
+    const { request: normalizedRequest, result } = await simulateVirtualResourceRequest(
+      request,
+      client
+    )
+
+    //Then the supplied account selects no RCPs rather than the account in the ARN
+    if (result.resultType !== 'single') {
+      assert.fail(`Expected a single result, got ${result.resultType}`)
+    }
+    expect(normalizedRequest.resource.accountId).toBe(outsideAccountId)
+    expect(result.overallResult).toEqual('Allowed')
+  })
+
+  it('should reject a resource ARN without an account ID', async () => {
+    //Given a virtual-resource request whose ARN has no account segment
+    const client = await organizationWithOuRcp()
+    const request = {
+      ...readRequest(memberAccountId),
+      resourceArn: 'arn:aws:s3:::key/uncollected-key'
+    }
+
+    //When simulating the request
+    const simulation = simulateVirtualResourceRequest(request, client)
+
+    //Then the request is rejected before policy evaluation
+    await expect(simulation).rejects.toThrow(
+      'Virtual resource arn:aws:s3:::key/uncollected-key must contain an account ID.'
+    )
+  })
+
+  it('should reject a wildcard-only action, as the external resource variant does', async () => {
+    //Given a wildcard-only action against a concrete resource
+    const client = await organizationWithOuRcp()
+    const request = { ...readRequest(memberAccountId), action: 'iam:ListUsers' }
+
+    //When simulating the request as a virtual and as an external resource
+    const virtual = simulateVirtualResourceRequest(request, client)
+    const external = simulateExternalResourceRequest(request, client)
+
+    //Then both resource-side variants reject it
+    await expect(virtual).rejects.toThrow(
+      'Virtual resource simulations do not support wildcard-only actions.'
+    )
+    await expect(external).rejects.toThrow(
+      'External resource simulations do not support wildcard-only actions.'
+    )
+  })
+
+  it('should reject a principal that is not collected', async () => {
+    //Given a virtual-resource request from a principal absent from the collected data
+    const client = await organizationWithOuRcp()
+    const request = {
+      ...readRequest(memberAccountId),
+      principal: `arn:aws:iam::${principalAccountId}:role/Uncollected`
+    }
+
+    //When simulating the request
+    const simulation = simulateVirtualResourceRequest(request, client)
+
+    //Then the collected-principal requirement is enforced
+    await expect(simulation).rejects.toThrow(/does not exist/)
+  })
+})

@@ -1,0 +1,82 @@
+{
+  "iam-data-482734": {
+    "accountId": "100000000002",
+    "region": "us-west-2"
+  },
+  "no-principal-bucket": {
+    "accountId": "100000000002",
+    "region": "us-west-2"
+  },
+  "restricted-bucket": {
+    "accountId": "100000000002",
+    "region": "us-west-2"
+  },
+  "finance-bucket": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "finance-bucket-w-abac": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "sales-bucket": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "sales-bucket-w-abac": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "vpc-bucket": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-acct": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-org": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-principal": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-session": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-session-userid": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-session-xacct": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-session-pathless": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "who-can-account-and-session": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "eu-example-data-lake": {
+    "accountId": "100000000001",
+    "region": "us-west-2"
+  },
+  "wildcard-bucket": {
+    "accountId": "100000000001",
+    "region": "us-west-2"
+  },
+  "source-arn-deny-bucket": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  },
+  "anonymous-principal-org-conditions": {
+    "accountId": "200000000002",
+    "region": "us-west-2"
+  }
+}

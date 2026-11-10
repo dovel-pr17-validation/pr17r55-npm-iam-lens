@@ -1,0 +1,20 @@
+name: Update Dependencies
+
+on:
+  schedule:
+    - cron: '35 9 * * 6' # Every Saturday at 09:35 UTC
+  workflow_dispatch:
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Push branches, merge PRs, delete branches
+      pull-requests: write # Create and merge PRs
+      actions: write # Run check workflows
+    steps:
+      - name: Run dependency update
+        uses: cloud-copilot/action-update-dependencies@c91f020c74faf612daf4297704c78b6898feaae0
+        with:
+          check-workflow: pr-checks.yml
+          post-merge-workflow: release.yml

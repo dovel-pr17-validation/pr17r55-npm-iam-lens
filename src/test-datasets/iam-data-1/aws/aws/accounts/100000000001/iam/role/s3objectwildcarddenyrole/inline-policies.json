@@ -1,0 +1,34 @@
+[
+  {
+    "PolicyName": "S3ObjectWildcardDeny",
+    "PolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AllowPrivate",
+          "Effect": "Allow",
+          "Action": ["s3:GetObject"],
+          "Resource": "arn:aws:s3:::wildcard-bucket/reports/private/*"
+        },
+        {
+          "Sid": "DenyPrivate",
+          "Effect": "Deny",
+          "Action": ["s3:GetObject"],
+          "Resource": "arn:aws:s3:::wildcard-bucket/reports/private/*"
+        },
+        {
+          "Sid": "AllowFoundationModel",
+          "Effect": "Allow",
+          "Action": "bedrock:GetFoundationModel",
+          "Resource": "arn:aws:bedrock:us-east-1::foundation-model/denied.model-v1:0"
+        },
+        {
+          "Sid": "DenyFoundationModel",
+          "Effect": "Deny",
+          "Action": "bedrock:GetFoundationModel",
+          "Resource": "arn:aws:bedrock:us-east-1::foundation-model/denied.model-v1:0"
+        }
+      ]
+    }
+  }
+]

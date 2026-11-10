@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCanonicalAnonymousContext",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::anonymous-context-bucket/matching/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:userid": "anonymous",
+          "aws:PrincipalType": "Anonymous"
+        }
+      }
+    },
+    {
+      "Sid": "AllowKnownAbsentContextObject",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::anonymous-context-bucket/known-absent/all"
+    },
+    {
+      "Sid": "DenyUnsignedRequestsWithKnownAbsentContext",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::anonymous-context-bucket/known-absent/all",
+      "Condition": {
+        "Null": {
+          "aws:CalledVia": "true",
+          "aws:CalledViaFirst": "true",
+          "aws:CalledViaLast": "true",
+          "aws:Ec2InstanceSourcePrivateIPv4": "true",
+          "aws:Ec2InstanceSourceVPC": "true",
+          "aws:FederatedProvider": "true",
+          "aws:MultiFactorAuthAge": "true",
+          "aws:MultiFactorAuthPresent": "true",
+          "aws:PrincipalServiceNamesList": "true",
+          "aws:SourceIdentity": "true",
+          "aws:TokenIssueTime": "true",
+          "aws:ViaAWSService": "true",
+          "s3:authType": "true",
+          "s3:signatureversion": "true",
+          "s3:signatureAge": "true"
+        }
+      }
+    },
+    {
+      "Sid": "AllowNonAnonymousPrincipalType",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::anonymous-context-bucket/non-anonymous/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalType": "User"
+        }
+      }
+    }
+  ]
+}

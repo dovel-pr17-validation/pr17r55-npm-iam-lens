@@ -1,0 +1,73 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Statement1",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "sts:AssumeRole",
+      "NotResource": "arn:aws:iam::100000000002:role/TestCrossAccount",
+      "Condition": {
+        "Null": {
+          "sts:ExternalId": "true"
+        },
+        "StringNotEquals": {
+          "aws:PrincipalOrgId": "o-11111111"
+        },
+        "BoolIfExists": {
+          "aws:PrincipalIsAWSService": "false"
+        }
+      }
+    },
+    {
+      "Sid": "BedrockModelDeny",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "bedrock:GetFoundationModel",
+      "Resource": "arn:aws:bedrock:us-east-1::foundation-model/example.model-v1:0"
+    },
+    {
+      "Sid": "S3BucketAccess",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:*"],
+      "Resource": ["arn:aws:s3:::restricted-bucket", "arn:aws:s3:::restricted-bucket/*"]
+    },
+    {
+      "Sid": "ListBuckets",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:ListAllMyBuckets"],
+      "Resource": ["*"],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::100000000002:user/user2"
+        }
+      }
+    },
+    {
+      "Sid": "RestrictReadIamData",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::iam-data-482734/*"],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalOrgId": "o-22222222"
+        }
+      }
+    },
+    {
+      "Sid": "BlockSpecificAccount",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::iam-data-482734/*"],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalAccount": "300000000003"
+        }
+      }
+    }
+  ]
+}

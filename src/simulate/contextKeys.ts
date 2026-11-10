@@ -1,0 +1,559 @@
+import { equalsIgnoreCase } from '@actsecurity/iam-utils'
+import { iamActionDetails, iamActionExists, iamResourceTypeDetails } from '@actsecurity/iam-data'
+import {
+  actionSupportsAwsResourceInfoContextKeys,
+  bucketArn,
+  convertAssumedRoleArnToRoleArn,
+  isS3BucketOrObjectArn,
+  splitArnParts
+} from '@actsecurity/iam-utils'
+import { IamCollectClient } from '../collect/client.js'
+import { isArnPrincipal, isServicePrincipal } from '../principals.js'
+import type { InternalSimulationRequest } from './simulate.js'
+
+/**
+ * Context keys for IAM simulation requests.
+ *
+ * These keys are used to provide additional context for the simulation, such as
+ * the principal making the request, the resource being accessed, and any additional
+ * context keys that may be required for the simulation.
+ */
+export type ContextKeys = Record<string, string | string[]>
+
+/**
+ * Controls optional collected metadata lookups while deriving context keys.
+ */
+export interface CreateContextKeysOptions {
+  /**
+   * Whether resource tags and presence should be loaded from collected data.
+   */
+  includeResourceMetadata?: boolean
+
+  /**
+   * Whether principal tags should be loaded from collected IAM metadata.
+   */
+  includePrincipalTags?: boolean
+}
+
+/**
+ * Placeholder for the caller account AWS supplies on a service-mediated KMS request.
+ *
+ * iam-lens does not know the actual account, so Discovery treats this value as non-authoritative.
+ */
+export const servicePrincipalKmsCallerAccountPlaceholder = '111111111111'
+
+export const knownContextKeys: readonly string[] = [
+  'aws:SecureTransport',
+  'aws:CurrentTime',
+  'aws:EpochTime',
+
+  'aws:PrincipalArn',
+  'aws:PrincipalAccount',
+  'aws:PrincipalOrgId',
+  'aws:PrincipalOrgPaths',
+  'aws:PrincipalType',
+  'aws:username',
+
+  'aws:ResourceAccount',
+  'aws:ResourceOrgID',
+  'aws:ResourceOrgPaths',
+
+  'aws:PrincipalIsAWSService',
+  'aws:PrincipalServiceName',
+  'aws:SourceAccount',
+  'aws:SourceOrgID',
+  'aws:SourceOrgPaths',
+  'aws:SourceOwner',
+  'aws:SourceArn',
+
+  'kms:CallerAccount'
+]
+
+/**
+ * Discovery key patterns for the resource tag keys iam-lens fills from a resource's collected tags.
+ *
+ * A caller's Discovery constraint replaces one of these only when its key name is the same text,
+ * compared case-insensitively.
+ */
+export const RESOURCE_TAG_KEY_PATTERNS = {
+  /** `aws:ResourceTag/<key>` */
+  resourceTag: '/^aws:ResourceTag/.*/',
+
+  /** `s3:BucketTag/<key>`, on a bucket or an object in it */
+  bucketTag: '/^s3:BucketTag/.*/',
+
+  /**
+   * Service-prefixed resource tag keys, such as `ec2:ResourceTag/<key>` or `ssm:resourceTag/<key>`.
+   */
+  serviceResourceTag: '/^(?!aws:)[a-z0-9-]+:ResourceTag/.*/'
+} as const
+
+const serviceResourceTagKeyPrefix = /^(?!aws:)[a-z0-9-]+:resourcetag\//i
+
+export const CONTEXT_KEYS = {
+  assumedRoot: 'aws:AssumedRoot',
+  userId: 'aws:userid',
+  vpc: 'aws:SourceVpc',
+  vpcEndpointId: 'aws:SourceVpce',
+  vpcEndpointAccount: 'aws:VpceAccount',
+  vpcEndpointOrgId: 'aws:VpceOrgID',
+  vpcEndpointOrgPaths: 'aws:VpceOrgPaths',
+  vpcArn: 'aws:SourceVpcArn'
+}
+
+/** Context keys AWS leaves absent on every unsigned request iam-lens currently models. */
+export const anonymousKnownAbsentContextKeyNames = [
+  'aws:CalledVia',
+  'aws:CalledViaFirst',
+  'aws:CalledViaLast',
+  'aws:Ec2InstanceSourcePrivateIPv4',
+  'aws:Ec2InstanceSourceVPC',
+  'aws:FederatedProvider',
+  'aws:MultiFactorAuthAge',
+  'aws:MultiFactorAuthPresent',
+  'aws:PrincipalServiceNamesList',
+  'aws:SourceIdentity',
+  'aws:TokenIssueTime',
+  'aws:ViaAWSService',
+  's3:authType',
+  's3:signatureversion',
+  's3:signatureAge'
+] as const
+
+const anonymousPrincipalContextKeys = new Set([
+  'aws:assumedroot',
+  'aws:username',
+  'aws:userid',
+  'kms:calleraccount',
+  ...anonymousKnownAbsentContextKeyNames.map((key) => key.toLowerCase())
+])
+
+/**
+ * Determine whether a context key requires an authenticated principal or its credentials.
+ *
+ * Anonymous requests cannot supply these keys as overrides because AWS treats the corresponding
+ * principal identity as absent. Principal-prefixed keys include fixed keys such as
+ * `aws:PrincipalArn` and dynamic keys such as `aws:PrincipalTag/team`.
+ *
+ * @param key context key name to classify
+ * @returns whether the key is unavailable to anonymous requests
+ */
+export function isAnonymousPrincipalContextKey(key: string): boolean {
+  const normalizedKey = key.toLowerCase()
+  return (
+    normalizedKey.startsWith('aws:principal') || anonymousPrincipalContextKeys.has(normalizedKey)
+  )
+}
+
+/**
+ * Checks if a context has a specific key (case-insensitive).
+ *
+ * @param context - The context to check.
+ * @param key - The key to check for.
+ * @returns True if the context has the key, false otherwise.
+ */
+export function contextHasKey(context: ContextKeys, key: string): boolean {
+  return !!contextValue(context, key)
+}
+
+/**
+ * Get the value of a context key (case-insensitive).
+ *
+ * @param context - The context to check.
+ * @param key - The key to get the value for.
+ * @returns The value of the context key, or undefined if it doesn't exist.
+ */
+export function contextValue(context: ContextKeys, key: string): string | string[] | undefined {
+  const matchingKey = Object.keys(context).find((contextKey) => equalsIgnoreCase(contextKey, key))
+  return matchingKey ? context[matchingKey] : undefined
+}
+
+/**
+ * Get the context keys for a simulation request.
+ *
+ * @param collectClient the collect client to use for fetching data
+ * @param simulationRequest the simulation request to create context keys for
+ * @param service the service the request is for
+ * @param contextKeyOverrides the context key overrides to apply
+ * @param resolvedPrincipalArnForContext canonical principal ARN to use for role-backed context keys
+ * @param options controls collected resource metadata lookups
+ * @returns a promise that resolves to the context keys for the simulation request
+ */
+export async function createContextKeys(
+  collectClient: IamCollectClient,
+  simulationRequest: InternalSimulationRequest,
+  service: string,
+  contextKeyOverrides: ContextKeys,
+  resolvedPrincipalArnForContext?: string,
+  options: CreateContextKeysOptions = {}
+): Promise<{ resourceTagsAreKnown: boolean; contextKeys: ContextKeys }> {
+  const contextKeys: ContextKeys = {
+    'aws:SecureTransport': 'true',
+    'aws:CurrentTime': new Date().toISOString(),
+    'aws:EpochTime': Math.floor(Date.now() / 1000).toString()
+  }
+
+  const principal = simulationRequest.principal
+  if (!principal) {
+    contextKeys['aws:userid'] = 'anonymous'
+    contextKeys['aws:PrincipalType'] = 'Anonymous'
+    if (equalsIgnoreCase(service, 'sqs')) {
+      contextKeys['aws:PrincipalAccount'] = 'anonymous'
+    }
+  } else if (isArnPrincipal(principal)) {
+    const arnParts = splitArnParts(principal)
+    const principalArnForContext =
+      resolvedPrincipalArnForContext ??
+      (arnParts.resourceType === 'assumed-role'
+        ? convertAssumedRoleArnToRoleArn(principal)
+        : principal)
+    contextKeys['aws:PrincipalArn'] = principalArnForContext
+    const principalAccountId = arnParts.accountId!
+    contextKeys['aws:PrincipalAccount'] = arnParts.accountId || ''
+
+    const orgId = await collectClient.getOrgIdForAccount(principalAccountId)
+    if (orgId) {
+      contextKeys['aws:PrincipalOrgId'] = orgId
+
+      const orgStructure = await collectClient.getOrgUnitHierarchyForAccount(principalAccountId)
+      contextKeys['aws:PrincipalOrgPaths'] = makeOrgPaths(orgId, orgStructure)
+    }
+
+    if (options.includePrincipalTags !== false) {
+      const { tags } = await collectClient.getTagsForResource(
+        principalArnForContext,
+        principalAccountId
+      )
+
+      for (const [key, value] of Object.entries(tags)) {
+        contextKeys[`aws:PrincipalTag/${key}`] = value
+      }
+    }
+
+    contextKeys['aws:PrincipalIsAWSService'] = 'false'
+
+    if (equalsIgnoreCase(service, 'kms')) {
+      contextKeys['kms:CallerAccount'] = principalAccountId
+    }
+
+    if (principal.endsWith(':root')) {
+      contextKeys['aws:PrincipalType'] = 'Account'
+      contextKeys['aws:userid'] = principalAccountId
+    } else if (arnParts.resourceType === 'user') {
+      contextKeys['aws:PrincipalType'] = 'User'
+      const userUniqueId = await collectClient.getUniqueIdForIamResource(principal)
+      contextKeys['aws:userid'] = userUniqueId || 'UNKNOWN'
+      const userName = arnParts.resourcePath?.split('/').at(-1)!
+      contextKeys['aws:username'] = userName
+    } else if (arnParts.resourceType === 'federated-user') {
+      contextKeys['aws:PrincipalType'] = 'FederatedUser'
+      contextKeys['aws:userid'] = `${arnParts.accountId}:${arnParts.resourcePath}`
+    } else if (arnParts.resourceType === 'assumed-role' || arnParts.resourceType === 'role') {
+      contextKeys['aws:PrincipalType'] = 'AssumedRole'
+
+      //TODO: Set aws:userId for role principals
+      if (arnParts.resourceType === 'assumed-role') {
+        const sessionName = arnParts.resourcePath?.split('/').at(-1)!
+        const roleArn = convertAssumedRoleArnToRoleArn(principal)
+        const roleUniqueId = await collectClient.getUniqueIdForIamResource(roleArn)
+        contextKeys['aws:userid'] = `${roleUniqueId || 'UNKNOWN'}:${sessionName}`
+      }
+    }
+  }
+
+  // The selected resource region is the modeled request region when it is known.
+  if (simulationRequest.resourceArn && simulationRequest.resourceArn.startsWith('arn:')) {
+    const resourceArn = simulationRequest.resourceArn
+    const arnRegion = splitArnParts(resourceArn).region
+    let region = arnRegion && !/[*?]/.test(arnRegion) ? arnRegion : undefined
+    if (
+      !region &&
+      isS3BucketOrObjectArn(resourceArn) &&
+      options.includeResourceMetadata !== false
+    ) {
+      region = await collectClient.getRegionForBucket(
+        simulationRequest.resourceAccount!,
+        resourceArn
+      )
+    }
+    if (region && !/[*?]/.test(region)) {
+      contextKeys['aws:RequestedRegion'] = region
+    }
+  }
+
+  // S3 supplies the bucket owner's account under its service-specific key.
+  if (
+    equalsIgnoreCase(service, 's3') &&
+    simulationRequest.resourceAccount &&
+    simulationRequest.resourceArn &&
+    isS3BucketOrObjectArn(simulationRequest.resourceArn)
+  ) {
+    contextKeys['s3:ResourceAccount'] = simulationRequest.resourceAccount
+  }
+
+  //Resource context keys
+  if (actionSupportsAwsResourceInfoContextKeys(simulationRequest.action)) {
+    contextKeys['aws:ResourceAccount'] = simulationRequest.resourceAccount!
+
+    const resourceOrgId = await collectClient.getOrgIdForAccount(simulationRequest.resourceAccount!)
+    if (resourceOrgId) {
+      contextKeys['aws:ResourceOrgID'] = resourceOrgId
+
+      const orgStructure = await collectClient.getOrgUnitHierarchyForAccount(
+        simulationRequest.resourceAccount!
+      )
+
+      contextKeys['aws:ResourceOrgPaths'] = makeOrgPaths(resourceOrgId, orgStructure)
+    }
+  }
+
+  let resourceTagsAreKnown = false
+  if (simulationRequest.resourceArn && options.includeResourceMetadata !== false) {
+    const isBucket = isS3BucketOrObjectArn(simulationRequest.resourceArn)
+    const { tags: resourceTags, present: resourceTagsPreset } =
+      await collectClient.getTagsForResource(
+        isBucket ? bucketArn(simulationRequest.resourceArn) : simulationRequest.resourceArn,
+        simulationRequest.resourceAccount!
+      )
+    resourceTagsAreKnown = resourceTagsPreset
+    const serviceTagKeyPrefixes = await serviceResourceTagKeyPrefixes(simulationRequest.action)
+    for (const [key, value] of Object.entries(resourceTags)) {
+      contextKeys[`aws:ResourceTag/${key}`] = value
+      if (isBucket) {
+        contextKeys[`s3:BucketTag/${key}`] = value
+      }
+      for (const prefix of serviceTagKeyPrefixes) {
+        contextKeys[`${prefix}${key}`] = value
+      }
+    }
+  }
+
+  //Service Principal context keys
+  if (principal && isServicePrincipal(principal)) {
+    contextKeys['aws:PrincipalIsAWSService'] = 'true'
+    contextKeys['aws:PrincipalServiceName'] = principal
+    contextKeys['aws:SourceAccount'] = simulationRequest.resourceAccount!
+    contextKeys['aws:SourceOwner'] = simulationRequest.resourceAccount!
+    contextKeys['aws:SourceOrgID'] = contextKeys['aws:ResourceOrgID']
+    contextKeys['aws:SourceOrgPaths'] = contextKeys['aws:ResourceOrgPaths']
+
+    if (equalsIgnoreCase(service, 'kms')) {
+      contextKeys['kms:CallerAccount'] = servicePrincipalKmsCallerAccountPlaceholder
+    }
+
+    if (simulationRequest.simulationMode === 'Discovery') {
+      // Source key Discovery constraints make the concrete value non-authoritative;
+      // this placeholder only marks the key as present for service-originated requests.
+      contextKeys['aws:SourceArn'] = 'arn:aws:iam::000000000000:role/unknown-source'
+    }
+  }
+
+  applyContextKeyOverrides(contextKeys, contextKeyOverrides)
+
+  // VPC enrichment reads keys case-insensitively and only adds missing values, so it
+  // can use caller-provided VPC inputs without replacing any caller-provided value.
+  //Add VPC context keys
+  const vpcKeys = await getVpcKeys(contextKeys, service, collectClient)
+  for (const [key, value] of Object.entries(vpcKeys)) {
+    contextKeys[key] = value
+  }
+
+  return {
+    resourceTagsAreKnown,
+    contextKeys
+  }
+}
+
+/**
+ * Get the service-prefixed resource tag key prefixes an action's condition keys name, such as
+ * `ec2:ResourceTag/` for `ec2:TerminateInstances` or `iam:ResourceTag/` for `sts:AssumeRole`.
+ *
+ * These keys hold the same tags as `aws:ResourceTag/`. A prefix is returned once, with iam-data's
+ * casing; an action iam-data does not know returns none.
+ *
+ * @param action the request action, such as `ec2:TerminateInstances`
+ * @returns the key text before the tag key, such as `ec2:ResourceTag/`
+ */
+async function serviceResourceTagKeyPrefixes(action: string): Promise<string[]> {
+  const [service, actionName] = action.split(':')
+  if (!(await iamActionExists(service, actionName))) {
+    return []
+  }
+
+  const actionDetails = await iamActionDetails(service, actionName)
+  const resourceTypeKeys = await Promise.all(
+    actionDetails.resourceTypes.map(async (resourceType) => [
+      ...(resourceType.conditionKeys ?? []),
+      ...((await iamResourceTypeDetails(service, resourceType.name)).conditionKeys ?? [])
+    ])
+  )
+
+  const prefixesByLowerCase = new Map<string, string>()
+  for (const key of [...actionDetails.conditionKeys, ...resourceTypeKeys.flat()]) {
+    const prefix = key.match(serviceResourceTagKeyPrefix)?.[0]
+    if (prefix && !prefixesByLowerCase.has(prefix.toLowerCase())) {
+      prefixesByLowerCase.set(prefix.toLowerCase(), prefix)
+    }
+  }
+  return [...prefixesByLowerCase.values()]
+}
+
+/**
+ * Applies caller-provided context values over generated values using IAM's
+ * case-insensitive context-key matching.
+ *
+ * @param contextKeys the generated request context to update
+ * @param contextKeyOverrides the caller-provided authoritative values
+ */
+function applyContextKeyOverrides(
+  contextKeys: ContextKeys,
+  contextKeyOverrides: ContextKeys
+): void {
+  for (const [key, value] of Object.entries(contextKeyOverrides)) {
+    const generatedKey = Object.keys(contextKeys).find((contextKey) =>
+      equalsIgnoreCase(contextKey, key)
+    )
+    if (generatedKey && generatedKey !== key) {
+      delete contextKeys[generatedKey]
+    }
+    contextKeys[key] = value
+  }
+}
+
+/**
+ * Get the VPC keys that should be added to the context for a simulation.
+ *
+ * @param context the existing context
+ * @param service the service the request is for
+ * @param collectClient the IAM collect client
+ * @returns a record of VPC context keys
+ */
+export async function getVpcKeys(
+  context: ContextKeys,
+  service: string,
+  collectClient: IamCollectClient
+): Promise<ContextKeys> {
+  const vpcKeys: ContextKeys = {}
+
+  let vpcEndpointId = contextValue(context, CONTEXT_KEYS.vpcEndpointId)
+  const hasVpcEndpoint = !!vpcEndpointId
+  let vpcId = contextValue(context, CONTEXT_KEYS.vpc)
+  let vpcArn = contextValue(context, CONTEXT_KEYS.vpcArn)
+
+  //If we know the VPC ID but not the endpoint, lookup the endpoint
+  if (!vpcEndpointId && vpcId && typeof vpcId === 'string') {
+    vpcEndpointId = await collectClient.getVpcEndpointIdForVpcService(vpcId, service)
+  }
+
+  //If we know the VPC ARN but not the endpoint, lookup the endpoint
+  if (!vpcEndpointId && vpcArn && typeof vpcArn === 'string') {
+    vpcEndpointId = await collectClient.getVpcEndpointIdForVpcService(vpcArn, service)
+  }
+
+  if (vpcEndpointId && !vpcId) {
+    if (typeof vpcEndpointId == 'string') {
+      const vpcId = await collectClient.getVpcIdForVpcEndpointId(vpcEndpointId)
+      if (vpcId) {
+        vpcKeys[CONTEXT_KEYS.vpc] = vpcId
+      }
+    }
+  }
+
+  if (vpcEndpointId && !hasVpcEndpoint) {
+    vpcKeys[CONTEXT_KEYS.vpcEndpointId] = vpcEndpointId
+  }
+
+  if (
+    vpcEndpointId &&
+    typeof vpcEndpointId === 'string' &&
+    serviceSupportsExtraVpcEndpointData(service)
+  ) {
+    const vpcEndpointAccount = await collectClient.getAccountIdForVpcEndpointId(vpcEndpointId)
+    const vpcEndpointOrgId = await collectClient.getOrgIdForVpcEndpointId(vpcEndpointId)
+    const vpcEndpointOrgStructure =
+      await collectClient.getOrgUnitHierarchyForVpcEndpointId(vpcEndpointId)
+    const vpcArn = await collectClient.getVpcArnForVpcEndpointId(vpcEndpointId)
+
+    if (vpcEndpointAccount && !contextHasKey(context, CONTEXT_KEYS.vpcEndpointAccount)) {
+      vpcKeys[CONTEXT_KEYS.vpcEndpointAccount] = vpcEndpointAccount
+    }
+    if (vpcEndpointOrgId && !contextHasKey(context, CONTEXT_KEYS.vpcEndpointOrgId)) {
+      vpcKeys[CONTEXT_KEYS.vpcEndpointOrgId] = vpcEndpointOrgId
+    }
+    if (vpcArn && !contextHasKey(context, CONTEXT_KEYS.vpcArn)) {
+      vpcKeys[CONTEXT_KEYS.vpcArn] = vpcArn
+    }
+    if (
+      vpcEndpointOrgId &&
+      vpcEndpointOrgStructure &&
+      !contextHasKey(context, CONTEXT_KEYS.vpcEndpointOrgPaths)
+    ) {
+      vpcKeys[CONTEXT_KEYS.vpcEndpointOrgPaths] = makeOrgPaths(
+        vpcEndpointOrgId,
+        vpcEndpointOrgStructure
+      )
+    }
+  }
+
+  return vpcKeys
+}
+
+const servicesThatSupportExtraVpcEndpointData = new Set([
+  'apprunner',
+  'discovery',
+  'athena',
+  'servicediscovery',
+  'applicationinsights',
+  'cloudformation',
+  'comprehendmedical',
+  'compute-optimizer',
+  'ecr',
+  'ecs',
+  'kinesisanalytics',
+  'route53',
+  'datasync',
+  'ebs',
+  'scheduler',
+  'firehose',
+  'medical-imaging',
+  'healthlake',
+  'omics',
+  'iam',
+  'iotfleetwise',
+  'iotwireless',
+  'kms',
+  'lambda',
+  'payment-cryptography',
+  'polly',
+  'acm-pca',
+  'rbin',
+  'rekognition',
+  'servicequotas',
+  's3',
+  'storagegateway',
+  'ssm-contacts',
+  'textract',
+  'transcribe',
+  'transfer'
+])
+
+/**
+ * Check if a service supports extra VPC endpoint data.
+ *
+ * @param service the service to check
+ * @returns true if the service supports extra VPC endpoint data, false otherwise
+ */
+export function serviceSupportsExtraVpcEndpointData(service: string): boolean {
+  return servicesThatSupportExtraVpcEndpointData.has(service.toLowerCase())
+}
+
+/**
+ * Create a string array for an aws:xxOrgPaths context key value.
+ *
+ * @param orgId the organization ID
+ * @param hierarchy the organizational hierarchy
+ * @returns a string array representing the organizational paths
+ */
+function makeOrgPaths(orgId: string, hierarchy: string[]): string[] {
+  return [`${orgId}/${hierarchy.join('/')}/`]
+}
